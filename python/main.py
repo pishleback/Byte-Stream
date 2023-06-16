@@ -547,19 +547,6 @@ class Specification(Message):
         return cls(Lookup.decode(v[0]), {Key.decode(k) : Protocol.decode(p) for k, p in v[1]})
     
 
-class Context():
-    def __init__(self, messages):
-        messages = tuple(messages)
-        for msg in messages:
-            assert isinstance(msg, Message)
-        self.messages = {}
-        for msg in messages:
-            k = msg.get_name()
-            assert type(k) == Key
-            assert not k in self.messages
-            self.messages[k] = msg
-                
-
 META_CTX = Lookup({Key(b"key") : Key.get_type(),
                    Key(b"lookup") : Lookup.get_type(),
                    Key(b"type") : Type.get_type(),
@@ -844,10 +831,10 @@ def test_socket():
 
 
 if __name__ == "__main__":
-##    test()
+    test()
 ##    d = META_SPEC.serialize(META_SPEC.ctx)
 ##    print([b for b in d])
-    test_socket()
+##    test_socket()
 
 
 
