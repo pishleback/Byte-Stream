@@ -426,132 +426,104 @@ class Struct(Type):
         return cls(Lookup.decode(v))
 
 
-
-class Protocol():
-    def __eq__(self, other):
-        raise NotImplementedError(f"__eq__ not implemented for {type(self)}")
-    
-    @classmethod
-    def get_type(cls):
-        return Variant(Lookup({Key(b"function") : Tuple([Named(Key(b"type")), Named(Key(b"type"))]),
-                               Key(b"call") : Tuple([Named(Key(b"type")), Named(Key(b"type"))])}))
-
-    def encode(self):
-        return self.encode_impl()
-    def encode_impl(self):
-        raise NotImplementedError(f"encode_impl not implemented for {type(self)}")
-
-    @classmethod
-    def decode(cls, v):
-        k, w = v
-        return {Key(b"function") : Function,
-                Key(b"call") : Call}[k].decode_impl(w)
-    @classmethod
-    def decode_impl(cls, v):
-        raise NotImplementedError(f"decode_impl not implemented for {cls}")
-
-
-class Function(Protocol):
-    def __init__(self, arg, ret):
-        assert isinstance(arg, Type)
-        assert isinstance(ret, Type)
-        self.arg = arg
-        self.ret = ret
-
-    def __eq__(self, other):
-        if isinstance(other, type(self)):
-            return self.arg == other.arg and self.ret == other.ret
-        return False
-
-    def __repr__(self):
-        return f"Function({self.arg}, {self.ret})"
-
-    def encode_impl(self):
-        return Key(b"function"), [self.arg.encode(), self.ret.encode()]
-
-    @classmethod
-    def decode_impl(cls, v):
-        assert type(v) == list
-        assert len(v) == 2
-        return cls(Type.decode(v[0]), Type.decode(v[1]))
-    
-
-class Call(Protocol):
-    def __init__(self, arg, ret):
-        assert isinstance(arg, Type)
-        assert isinstance(ret, Type)
-        self.arg = arg
-        self.ret = ret
-
-    def __eq__(self, other):
-        if isinstance(other, type(self)):
-            return self.arg == other.arg and self.ret == other.ret
-        return False
-
-    def __repr__(self):
-        return f"Call({self.arg}, {self.ret})"
-
-    def encode_impl(self):
-        return Key(b"call"), [self.arg.encode(), self.ret.encode()]
-
-    @classmethod
-    def decode_impl(cls, v):
-        assert type(v) == list
-        assert len(v) == 2
-        return cls(Type.decode(v[0]), Type.decode(v[1]))
-
-
-
-
-class Specification(Message):
-    def __init__(self, ctx, protocols):
-        assert type(ctx) == Lookup
-        assert type(protocols) == dict
-        for k, p in protocols.items():
-            assert type(k) == Key
-            assert isinstance(p, Protocol)
-        self._ctx = ctx
-        self._protocols = protocols
-
+class Serializer():
+    def __init__(self, t, encode):
+        assert isinstance(t, Type)
+        self._t = t
+        self._encode = encode
     @property
-    def ctx(self):
-        return self._ctx
-
+    def get_type(self):
+        return self._t
     @property
-    def protocols(self):
-        return self._protocols
+    def serialize(self):
+        def f(obj):
+            return self._encode(obj)
+        return f
+    
+def MessageSerializer(msg):
+    return Serializer(msg.get_type(), msg.serialize)
+    
+class Deserializer():
+    def __init__(self, t, decode):
+        assert isinstance(t, Type)
+        self._t = t
+        self._decode = decode
+    @property
+    def get_type(self):
+        return self._t
+    @property
+    def deserialize(self):
+        def f(d):
+            v = self._decode(d)
+            return self._t.value_from_bytes(d)
+        return f
+    
+def MessageDeserializer(msg):
+    return Deserializer(msg.get_type(), msg.deserialize)
 
-    def __eq__(self, other):
-        if isinstance(other, type(self)):
-            return self.ctx == other.ctx and self.protocols == other.protocols
-        return False
 
-    def __repr__(self):
-        return f"Specification({self.ctx}, {self.protocols})"
-
-    @classmethod
-    def get_type(cls):
-        return Tuple([Lookup.get_type(), List(Tuple([Named(Key(b"key")), Named(Key(b"protocol"))]))])
-
-    def encode(self):
-        return [self.ctx.encode(), [[k.encode(), p.encode()] for k, p in self.protocols.items()]]
-
-    @classmethod
-    def decode(cls, v):
-        assert type(v) == list
-        assert len(v) == 2
-        assert type(v[1]) == list
-        for pair in v[1]:
-            assert type(pair) == list
-            assert len(pair) == 2
-        return cls(Lookup.decode(v[0]), {Key.decode(k) : Protocol.decode(p) for k, p in v[1]})
+##class Specification(Message):
+##    def __init__(self, ctx):
+##        assert type(ctx) == Lookup
+##        self.ctx = ctx
+##        self.functions = {}
+##        self.calls = {}
+##
+##    def add_func(self, name, input_deserializers, output_serializer):
+##        assert type(name) == Key
+##        input_deserializers = tuple(input_deserializers)
+##        for input_deserializer in input_deserializers:
+##            assert type(input_deserializer) == Deserializer
+##        assert type(output_serializer) == Serializer
+##
+##        assert not name in self.functions
+##        self.functions[name] = (input_deserializers, output_serializer)
+##
+##    def add_call(self, name, input_serializers, output_deserializer):
+##        assert type(name) == Key
+##        input_serializers = tuple(input_serializers)
+##        for input_serializer in input_serializers:
+##            assert type(input_serializer) == Serializer
+##        assert type(output_deserializer) == Deserializer
+##
+####        def f(*args):
+####            print("DOOO STUFFFF", args)
+####            assert (n := len(args)) == len(input_serializers)
+####            print(n)
+##
+##        assert not name in self.calls
+##        self.calls[name] = (input_serializers, output_deserializer)
+##
+##    def __eq__(self, other):
+##        if isinstance(other, type(self)):
+##            return self.ctx == other.ctx and self.protocols == other.protocols
+##        return False
+##
+##    def __repr__(self):
+##        return f"Specification({self.ctx}, {self.functions}, {self.calls})"
+##
+##    @classmethod
+##    def get_type(cls):
+##        return Tuple([Lookup.get_type(),
+##                      List(Tuple([Named(Key(b"key")), List(Named(Key(b"deserializer"))), Named(Key(b"serializer"))])),
+##                      List(Tuple([Named(Key(b"key")), List(Named(Key(b"serializer"))), Named(Key(b"deserializer"))]))])
+##
+##    def encode(self):
+##        return [self.ctx.encode(),
+##                [[name.encode(), [it.encode() for it in io[1]], io[2].encode()] for name, io in self.functions.items()],
+##                [[name.encode(), [it.encode() for it in io[1]], io[2].encode()] for name, io in self.calls.items()]]
+##
+##    @classmethod
+##    def decode(cls, v):
+##        assert type(v) == list
+##        assert len(v) == 3
+##        spec = cls(Lookup.decode(v[0]))
+##        return spec
     
 
 META_CTX = Lookup({Key(b"key") : Key.get_type(),
                    Key(b"lookup") : Lookup.get_type(),
-                   Key(b"type") : Type.get_type(),
-                   Key(b"protocol") : Protocol.get_type(),
-                   Key(b"spec") : Specification.get_type()})
+                   Key(b"type") : Type.get_type()})
 
 
 def test():
@@ -707,21 +679,20 @@ def test():
         print("TESTS PASSED :)")
 
 
-
 import socket
 import time
 import threading
 
+
 class Connection():
-    def __init__(self, sock, spec):
+    def __init__(self, sock, ctx):
         assert isinstance(sock, socket.socket)
-        assert type(spec) == Specification
+        assert type(ctx) == Lookup
         
+        self._ctx = ctx
         self._sock = sock
         self._sock.setblocking(False)
         self._buf = b""
-
-        self._spec = spec
 
         #handshake
         #1) check that metacontexts agree
@@ -730,24 +701,34 @@ class Connection():
         if META_CTX != other_META_CTX:
             raise Exception("Meta contexts do not agree")
         
-        #2) use the meta specification handshake function to exchange specifications 
-        self._send_dgram(self._spec.serialize(META_CTX))
-        other_spec = Specification.deserialize(META_CTX, self._recv_dgram())
-
-        #3) check that contexts agree
-        if self._spec.ctx != other_spec.ctx:
+        #2) check that contexts agree
+        self_ctx = self._ctx
+        self._send_dgram(self_ctx.serialize(META_CTX))
+        other_ctx = Lookup.deserialize(META_CTX, self._recv_dgram())
+        if self_ctx != other_ctx:
             raise Exception("Contexts do not agree")
 
-        #4) check that message flows are compatible
+    def register_function(self, f, inputs, output):
+        inputs = list(inputs)
+        for i in inputs:
+            assert type(i) == Deserializer
+        assert type(output) == Serializer
+
+    def register_caller(self, inputs, output):
+        inputs = list(inputs)
+        for i in inputs:
+            assert type(i) == Serializer
+        assert type(output) == Deserializer
         
-        import random
-        time.sleep(random.uniform(0, 0.5))
+        def f(*args):
+            assert (n := len(args)) == len(inputs)
+            for s, a in zip(inputs, args):
+                print(a, s.serialize(a))
         
-        print(threading.get_ident(), self._spec)
-        print(threading.get_ident(), other_spec)
+        return f
 
     def _send_dgram(self, data):
-        self._sock.sendall(Quantity().value_to_bytes(self._spec.ctx, len(data)) + data)
+        self._sock.sendall(Quantity().value_to_bytes(self._ctx, len(data)) + data)
 
     def _recv_dgrams(self, num_dgram):
         assert type(num_dgram) == int
@@ -773,7 +754,7 @@ class Connection():
                 return None
             
             #parse the quantity
-            idx, n = Quantity().value_from_bytes(self._spec.ctx, 0, self._buf)
+            idx, n = Quantity().value_from_bytes(self._ctx, 0, self._buf)
             #check if we have the whole dgram
             if idx + n <= len(self._buf):
                 dgram = self._buf[idx:idx+n]
@@ -806,16 +787,59 @@ def test_socket():
 
     s, _ = s.accept()
 
+    sock_a = s
+    sock_b = t
+
     def run_a():
-        a = Connection(s, Specification(Lookup({}),
-                                        {Key(b"flub") : Function(Byte(), Byte()),
-                                         Key(b"floobe") : Function(Quantity(), Quantity())}))
-
-    def run_b():
-        b = Connection(t, Specification(Lookup({}),
-                                        {Key(b"flub") : Call(Byte(), Byte())}))
+        class Int(Message):
+            def __init__(self, n):
+                assert type(n) == int
+                self.n = n
+            def __repr__(self):
+                return f"Int({self.n})"
+            @classmethod
+            def get_type(cls):
+                return Tuple([Quantity(), Quantity()])
+            def encode(self):
+                if self.n >= 0:
+                    return [self.n, 0]
+                else:
+                    return [0, -self.n]
+            @classmethod
+            def decode(cls, v):
+                assert len(v) == 2
+                return cls(Quantity.decode(v[0]) - Quantity.decode(v[1]))
+            
+        def flub(n):
+            return n + 1
         
+        def floobe(n):
+            return n * 2
 
+        a = Connection(sock_a, Lookup({}))
+        a.register_function(flub, [MessageDeserializer(Int)], MessageSerializer(Int))
+        a.register_function(floobe, [MessageDeserializer(Int)], MessageSerializer(Int))
+
+    
+    def run_b():
+
+        t = Tuple([Quantity(), Quantity()])
+        def encode(n):
+            if n >= 0:
+                return [n, 0]
+            else:
+                return [0, -n]
+        def decode(v):
+            assert len(v) == 2
+            return Quantity.decode(v[0]) - Quantity.decode(v[1])
+        
+        b = Connection(sock_b, Lookup({}))
+        flub = b.register_caller([Serializer(t, encode)], Deserializer(t, decode))
+        floobe = b.register_caller([Serializer(t, encode)], Deserializer(t, decode))
+
+        print(flub(4))
+        print(floobe(4))
+    
     thread_a = threading.Thread(target = run_a)
     thread_b = threading.Thread(target = run_b)
 
@@ -831,10 +855,10 @@ def test_socket():
 
 
 if __name__ == "__main__":
-    test()
+##    test()
 ##    d = META_SPEC.serialize(META_SPEC.ctx)
 ##    print([b for b in d])
-##    test_socket()
+    test_socket()
 
 
 
