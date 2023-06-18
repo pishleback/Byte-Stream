@@ -436,8 +436,9 @@ class Serializer():
         return self._t
     @property
     def serialize(self):
-        def f(obj):
-            return self._encode(obj)
+        def f(ctx, obj):
+            assert type(ctx) == Lookup
+            return self._t.value_to_bytes(ctx, self._encode(obj))
         return f
     
 def MessageSerializer(msg):
@@ -453,77 +454,325 @@ class Deserializer():
         return self._t
     @property
     def deserialize(self):
-        def f(d):
-            v = self._decode(d)
-            return self._t.value_from_bytes(d)
+        def f(ctx, d):
+            assert type(ctx) == Lookup
+            n, m = self._t.value_from_bytes(ctx, d)
+            assert n == len(d)
+            return self._decode(m)
         return f
     
 def MessageDeserializer(msg):
     return Deserializer(msg.get_type(), msg.deserialize)
 
 
-##class Specification(Message):
-##    def __init__(self, ctx):
-##        assert type(ctx) == Lookup
-##        self.ctx = ctx
-##        self.functions = {}
-##        self.calls = {}
-##
-##    def add_func(self, name, input_deserializers, output_serializer):
-##        assert type(name) == Key
-##        input_deserializers = tuple(input_deserializers)
-##        for input_deserializer in input_deserializers:
-##            assert type(input_deserializer) == Deserializer
-##        assert type(output_serializer) == Serializer
-##
-##        assert not name in self.functions
-##        self.functions[name] = (input_deserializers, output_serializer)
-##
-##    def add_call(self, name, input_serializers, output_deserializer):
-##        assert type(name) == Key
-##        input_serializers = tuple(input_serializers)
-##        for input_serializer in input_serializers:
-##            assert type(input_serializer) == Serializer
-##        assert type(output_deserializer) == Deserializer
-##
-####        def f(*args):
-####            print("DOOO STUFFFF", args)
-####            assert (n := len(args)) == len(input_serializers)
-####            print(n)
-##
-##        assert not name in self.calls
-##        self.calls[name] = (input_serializers, output_deserializer)
-##
-##    def __eq__(self, other):
-##        if isinstance(other, type(self)):
-##            return self.ctx == other.ctx and self.protocols == other.protocols
-##        return False
-##
-##    def __repr__(self):
-##        return f"Specification({self.ctx}, {self.functions}, {self.calls})"
-##
-##    @classmethod
-##    def get_type(cls):
-##        return Tuple([Lookup.get_type(),
-##                      List(Tuple([Named(Key(b"key")), List(Named(Key(b"deserializer"))), Named(Key(b"serializer"))])),
-##                      List(Tuple([Named(Key(b"key")), List(Named(Key(b"serializer"))), Named(Key(b"deserializer"))]))])
-##
-##    def encode(self):
-##        return [self.ctx.encode(),
-##                [[name.encode(), [it.encode() for it in io[1]], io[2].encode()] for name, io in self.functions.items()],
-##                [[name.encode(), [it.encode() for it in io[1]], io[2].encode()] for name, io in self.calls.items()]]
-##
-##    @classmethod
-##    def decode(cls, v):
-##        assert type(v) == list
-##        assert len(v) == 3
-##        spec = cls(Lookup.decode(v[0]))
-##        return spec
-    
-
 META_CTX = Lookup({Key(b"key") : Key.get_type(),
                    Key(b"lookup") : Lookup.get_type(),
                    Key(b"type") : Type.get_type()})
+
+
+
+import socket
+import time
+import threading
+
+
+
+
+
+def send_dgram(sock, buf):
+    sock.sendall(Quantity().value_to_bytes(Lookup({}), len(buf)) + buf)
+
+def recv_dgram(sock):
+    buf = b""
+    done = False
+    while not done:
+        try:
+            b = sock.recv(1)[0]
+        except BlockingIOError:
+            time.sleep(0.1)
+        else:
+            if b // 128 == 0: #end of quantity
+                done = True
+            buf += bytes([b])
+    idx, n = Quantity().value_from_bytes(Lookup({}), 0, buf)
+    buf = buf[idx:]
+    while len(buf) < n:
+        try:
+            buf += sock.recv(min(4096, n - len(buf)))
+        except BlockingIOError:
+            time.sleep(0.1)
+    return buf
+
+class Server():
+    def __init__(self, ctx, host, port):
+        assert type(ctx) == Lookup
+        self.ctx = ctx
+        
+        self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.socket.bind((host, port))
+        self.socket.settimeout(0.1)
+        self.socket.listen()
+
+        self.thread = threading.Thread(target = self.run)
+        self.stop_thread = False
+        self.lock = threading.Lock()
+
+    def __enter__(self):
+        self.thread.start()
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        with self.lock:
+            self.stop_thread = True
+        self.thread.join()
+
+    def run(self):
+        def handle(conn):
+            #1) compare metactx
+            send_dgram(conn, META_CTX.serialize(META_CTX))
+            d = recv_dgram(conn)
+            client_meta_ctx = Lookup.deserialize(META_CTX, d)
+            assert META_CTX == client_meta_ctx
+
+            #2) compare ctx
+            send_dgram(conn, self.ctx.serialize(META_CTX))
+            client_ctx = Lookup.deserialize(META_CTX, recv_dgram(conn))
+            assert self.ctx == client_ctx
+
+            print("tada")
+
+        handle_threads = []
+        while True:
+            for idx, thread in reversed(tuple(enumerate(handle_threads))):
+                if not thread.is_alive():
+                    handle_threads.pop(idx)
+            
+            with self.lock:
+                if self.stop_thread:
+                    for thread in handle_threads:
+                        thread.join()
+                    return
+            try:
+                conn, other_addr = self.socket.accept()
+            except socket.timeout:
+                pass
+            else:
+                thread = threading.Thread(target = handle, args = (conn,))
+                thread.start()
+                handle_threads.append(thread)
+
+
+class Client():
+    def __init__(self, ctx, host, port):
+        assert type(ctx) == Lookup
+        self.ctx = ctx
+        self.host = host
+        self.port = port
+
+        sock = self.make_connected_socket()
+        #1) compare metactx
+        send_dgram(sock, META_CTX.serialize(META_CTX))
+        server_meta_ctx = Lookup.deserialize(META_CTX, recv_dgram(sock))
+        assert META_CTX == server_meta_ctx
+
+        #2) compare ctx
+        send_dgram(sock, self.ctx.serialize(META_CTX))
+        server_ctx = Lookup.deserialize(META_CTX, recv_dgram(sock))
+        assert self.ctx == server_ctx
+
+    def make_connected_socket(self):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        while True:
+            try:
+                sock.connect((self.host, self.port))
+            except ConnectionRefusedError as e:
+                print(e)
+                print("Retrying...")
+            else:
+                return sock        
+
+
+
+class Connection():
+    def __init__(self, sock, ctx):
+        assert isinstance(sock, socket.socket)
+        assert type(ctx) == Lookup
+        
+        self._ctx = ctx
+        self._sock = sock
+        self._sock.setblocking(False)
+        self._buf = b""
+
+        #handshake
+        #1) check that metacontexts agree
+        self._send_dgram(META_CTX.serialize(META_CTX))
+        other_META_CTX = Lookup.deserialize(META_CTX, self._recv_dgram())
+        if META_CTX != other_META_CTX:
+            raise Exception("Meta contexts do not agree")
+        
+        #2) check that contexts agree
+        self_ctx = self._ctx
+        self._send_dgram(self_ctx.serialize(META_CTX))
+        other_ctx = Lookup.deserialize(META_CTX, self._recv_dgram())
+        if self_ctx != other_ctx:
+            raise Exception("Contexts do not agree")
+
+    def register_function(self, f, input_deserializers, output_serializer):
+        input_deserializers = list(input_deserializers)
+        for input_deserializer in input_deserializers:
+            assert type(input_deserializer) == Deserializer
+        assert type(output_serializer) == Serializer
+
+    def register_caller(self, input_serializers, output_deserializer):
+        input_serializers = list(input_serializers)
+        for input_serializer in input_serializers:
+            assert type(input_serializer) == Serializer
+        assert type(output_deserializer) == Deserializer
+        
+        def f(*args):
+            assert (n := len(args)) == len(input_serializers)
+            for s, a in zip(input_serializers, args):
+                self._send_dgram(s.serialize(self._ctx, a))
+            return output_deserializer.deserialize(self._ctx, self._recv_dgrams(1))
+        
+        return f
+
+    def _send_dgram(self, data):
+        self._sock.sendall(Quantity().value_to_bytes(self._ctx, len(data)) + data)
+
+    def _recv_dgrams(self, num_dgram):
+        assert type(num_dgram) == int
+        assert num_dgram >= 0
+
+        dgrams = []
+        
+        #recv as much as possible and put it in self._buf
+        while True:
+            try:
+                self._buf += self._sock.recv(4096)
+            except BlockingIOError:
+                #nothing left to recv
+                break
+            
+        #read dgrams from self._buf
+        while num_dgram > 0:
+            #check that self._buf has enough bytes to store a quantity
+            for b in self._buf:
+                if b // 128 == 0:
+                    break
+            else:
+                return None
+            
+            #parse the quantity
+            idx, n = Quantity().value_from_bytes(self._ctx, 0, self._buf)
+            #check if we have the whole dgram
+            if idx + n <= len(self._buf):
+                dgram = self._buf[idx:idx+n]
+                self._buf = self._buf[idx+n:] #remove the dgram from self._buf
+                dgrams.append(dgram)
+            else:
+                return None
+            num_dgram -= 1
+
+        return dgrams
+
+    def _recv_dgram(self):
+        while True:
+            dgrams = self._recv_dgrams(1)
+            if not dgrams is None:
+                return dgrams[0]
+            time.sleep(0.1)
+                
+
+
+
+        
+
+def test_socket():
+    ctx = Lookup({})
+    with Server(ctx, "127.0.0.1", 5000) as server:
+        client = Client(ctx, "127.0.0.1", 5000)
+        time.sleep(1)
+        client = Client(ctx, "127.0.0.1", 5000)
+        time.sleep(10)
+
+    print("boo")
+
+    return 
+    
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.bind(("127.0.0.1", 5000))
+    s.listen()
+
+    t = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    t.connect(("127.0.0.1", 5000))
+
+    s, _ = s.accept()
+
+    sock_a = s
+    sock_b = t
+
+    def run_a():
+        class Int(Message):
+            def __init__(self, n):
+                assert type(n) == int
+                self.n = n
+            def __repr__(self):
+                return f"Int({self.n})"
+            @classmethod
+            def get_type(cls):
+                return Tuple([Quantity(), Quantity()])
+            def encode(self):
+                if self.n >= 0:
+                    return [self.n, 0]
+                else:
+                    return [0, -self.n]
+            @classmethod
+            def decode(cls, v):
+                assert len(v) == 2
+                return cls(Quantity.decode(v[0]) - Quantity.decode(v[1]))
+            
+        def flub(n):
+            return n + 1
+        
+        def floobe(n):
+            return n * 2
+
+        a = Connection(sock_a, Lookup({}))
+        a.register_function(flub, [MessageDeserializer(Int)], MessageSerializer(Int))
+        a.register_function(floobe, [MessageDeserializer(Int)], MessageSerializer(Int))
+
+    
+    def run_b():
+
+        t = Tuple([Quantity(), Quantity()])
+        def encode(n):
+            if n >= 0:
+                return [n, 0]
+            else:
+                return [0, -n]
+        def decode(v):
+            assert len(v) == 2
+            return Quantity.decode(v[0]) - Quantity.decode(v[1])
+        
+        b = Connection(sock_b, Lookup({}))
+        flub = b.register_caller([Serializer(t, encode)], Deserializer(t, decode))
+        floobe = b.register_caller([Serializer(t, encode)], Deserializer(t, decode))
+
+        print(flub(4))
+        print(floobe(4))
+    
+    thread_a = threading.Thread(target = run_a)
+    thread_b = threading.Thread(target = run_b)
+
+    thread_a.start()
+    thread_b.start()
+
+    thread_a.join()
+    thread_b.join()
+
+    print("done")
+
+
 
 
 def test():
@@ -677,180 +926,6 @@ def test():
         raise e
     else:
         print("TESTS PASSED :)")
-
-
-import socket
-import time
-import threading
-
-
-class Connection():
-    def __init__(self, sock, ctx):
-        assert isinstance(sock, socket.socket)
-        assert type(ctx) == Lookup
-        
-        self._ctx = ctx
-        self._sock = sock
-        self._sock.setblocking(False)
-        self._buf = b""
-
-        #handshake
-        #1) check that metacontexts agree
-        self._send_dgram(META_CTX.serialize(META_CTX))
-        other_META_CTX = Lookup.deserialize(META_CTX, self._recv_dgram())
-        if META_CTX != other_META_CTX:
-            raise Exception("Meta contexts do not agree")
-        
-        #2) check that contexts agree
-        self_ctx = self._ctx
-        self._send_dgram(self_ctx.serialize(META_CTX))
-        other_ctx = Lookup.deserialize(META_CTX, self._recv_dgram())
-        if self_ctx != other_ctx:
-            raise Exception("Contexts do not agree")
-
-    def register_function(self, f, inputs, output):
-        inputs = list(inputs)
-        for i in inputs:
-            assert type(i) == Deserializer
-        assert type(output) == Serializer
-
-    def register_caller(self, inputs, output):
-        inputs = list(inputs)
-        for i in inputs:
-            assert type(i) == Serializer
-        assert type(output) == Deserializer
-        
-        def f(*args):
-            assert (n := len(args)) == len(inputs)
-            for s, a in zip(inputs, args):
-                print(a, s.serialize(a))
-        
-        return f
-
-    def _send_dgram(self, data):
-        self._sock.sendall(Quantity().value_to_bytes(self._ctx, len(data)) + data)
-
-    def _recv_dgrams(self, num_dgram):
-        assert type(num_dgram) == int
-        assert num_dgram >= 0
-
-        dgrams = []
-        
-        #recv as much as possible and put it in self._buf
-        while True:
-            try:
-                self._buf += self._sock.recv(4096)
-            except BlockingIOError:
-                #nothing left to recv
-                break
-            
-        #read dgrams from self._buf
-        while num_dgram > 0:
-            #check that self._buf has enough bytes to store a quantity
-            for b in self._buf:
-                if b // 128 == 0:
-                    break
-            else:
-                return None
-            
-            #parse the quantity
-            idx, n = Quantity().value_from_bytes(self._ctx, 0, self._buf)
-            #check if we have the whole dgram
-            if idx + n <= len(self._buf):
-                dgram = self._buf[idx:idx+n]
-                self._buf = self._buf[idx+n:] #remove the dgram from self._buf
-                dgrams.append(dgram)
-            else:
-                return None
-            num_dgram -= 1
-
-        return dgrams
-
-    def _recv_dgram(self):
-        while True:
-            dgrams = self._recv_dgrams(1)
-            if not dgrams is None:
-                return dgrams[0]
-            time.sleep(0.1)
-                
-
-
-        
-
-def test_socket():    
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.bind(("127.0.0.1", 5000))
-    s.listen()
-
-    t = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    t.connect(("127.0.0.1", 5000))
-
-    s, _ = s.accept()
-
-    sock_a = s
-    sock_b = t
-
-    def run_a():
-        class Int(Message):
-            def __init__(self, n):
-                assert type(n) == int
-                self.n = n
-            def __repr__(self):
-                return f"Int({self.n})"
-            @classmethod
-            def get_type(cls):
-                return Tuple([Quantity(), Quantity()])
-            def encode(self):
-                if self.n >= 0:
-                    return [self.n, 0]
-                else:
-                    return [0, -self.n]
-            @classmethod
-            def decode(cls, v):
-                assert len(v) == 2
-                return cls(Quantity.decode(v[0]) - Quantity.decode(v[1]))
-            
-        def flub(n):
-            return n + 1
-        
-        def floobe(n):
-            return n * 2
-
-        a = Connection(sock_a, Lookup({}))
-        a.register_function(flub, [MessageDeserializer(Int)], MessageSerializer(Int))
-        a.register_function(floobe, [MessageDeserializer(Int)], MessageSerializer(Int))
-
-    
-    def run_b():
-
-        t = Tuple([Quantity(), Quantity()])
-        def encode(n):
-            if n >= 0:
-                return [n, 0]
-            else:
-                return [0, -n]
-        def decode(v):
-            assert len(v) == 2
-            return Quantity.decode(v[0]) - Quantity.decode(v[1])
-        
-        b = Connection(sock_b, Lookup({}))
-        flub = b.register_caller([Serializer(t, encode)], Deserializer(t, decode))
-        floobe = b.register_caller([Serializer(t, encode)], Deserializer(t, decode))
-
-        print(flub(4))
-        print(floobe(4))
-    
-    thread_a = threading.Thread(target = run_a)
-    thread_b = threading.Thread(target = run_b)
-
-    thread_a.start()
-    thread_b.start()
-
-    thread_a.join()
-    thread_b.join()
-
-    print("done")
-
 
 
 
