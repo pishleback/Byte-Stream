@@ -1,3 +1,5 @@
+import enum
+
 class Message():
     @classmethod
     def get_type(cls):
@@ -10,7 +12,7 @@ class Message():
     @classmethod
     def deserialize(cls, ctx, data):
         assert type(ctx) == Lookup
-        n, value = cls.get_type().value_from_bytes(ctx, 0, data)
+        n, value = cls.get_type().value_from_partial_bytes(ctx, 0, data)
         assert n == len(data)
         return cls.decode(value)
     
@@ -116,9 +118,14 @@ class Type(Message):
         assert type(ctx) == Lookup
         raise NotImplementedError(f"value_to_bytes not implemented for {type(self)}")
 
-    def value_from_bytes(self, ctx, idx, data):
+    def value_from_partial_bytes(self, ctx, idx, data):
         assert type(ctx) == Lookup
-        raise NotImplementedError(f"value_from_bytes not implemented for {type(self)}")
+        raise NotImplementedError(f"value_from_partial_bytes not implemented for {type(self)}")
+
+    def value_from_bytes(self, ctx, data):
+        n, val = self.value_from_partial_bytes(ctx, 0, data)
+        assert n == len(data)
+        return val
 
     @classmethod
     def get_type(cls):
@@ -171,9 +178,9 @@ class Named(Type):
         assert type(ctx) == Lookup
         return ctx[self.key].value_to_bytes(ctx, v)
 
-    def value_from_bytes(self, ctx, idx, data):
+    def value_from_partial_bytes(self, ctx, idx, data):
         assert type(ctx) == Lookup
-        return ctx[self.key].value_from_bytes(ctx, idx, data)
+        return ctx[self.key].value_from_partial_bytes(ctx, idx, data)
 
     def encode_impl(self):
         return Key(b"named"), self.key.encode()
@@ -204,7 +211,7 @@ class Byte(Type):
         assert type(ctx) == Lookup
         return v
 
-    def value_from_bytes(self, ctx, idx, data):
+    def value_from_partial_bytes(self, ctx, idx, data):
         assert type(ctx) == Lookup
         return idx + 1, data[idx:idx+1]
 
@@ -242,7 +249,7 @@ class Quantity(Type):
         data += bytes([v])
         return data
 
-    def value_from_bytes(self, ctx, idx, data):
+    def value_from_partial_bytes(self, ctx, idx, data):
         assert type(ctx) == Lookup
         n = 0
         p = 0
@@ -293,11 +300,11 @@ class Tuple(Type):
             data += t.value_to_bytes(ctx, w)
         return data
 
-    def value_from_bytes(self, ctx, idx, data):
+    def value_from_partial_bytes(self, ctx, idx, data):
         assert type(ctx) == Lookup
         v = []
         for t in self.ts:
-            idx, w = t.value_from_bytes(ctx, idx, data)
+            idx, w = t.value_from_partial_bytes(ctx, idx, data)
             v.append(w)
         return idx, v
 
@@ -332,12 +339,12 @@ class List(Type):
         assert type(ctx) == Lookup
         return Quantity().value_to_bytes(ctx, len(v)) + b"".join([self.t.value_to_bytes(ctx, w) for w in v])
 
-    def value_from_bytes(self, ctx, idx, data):
+    def value_from_partial_bytes(self, ctx, idx, data):
         assert type(ctx) == Lookup
-        idx, n = Quantity().value_from_bytes(ctx, idx, data)
+        idx, n = Quantity().value_from_partial_bytes(ctx, idx, data)
         v = []
         for i in range(n):
-            idx, w = self.t.value_from_bytes(ctx, idx, data)
+            idx, w = self.t.value_from_partial_bytes(ctx, idx, data)
             v.append(w)
         return idx, v
 
@@ -377,11 +384,11 @@ class Variant(Type):
         n = self.options.index(k)
         return Quantity().value_to_bytes(ctx, n) + self.options[k].value_to_bytes(ctx, w)
 
-    def value_from_bytes(self, ctx, idx, data):
+    def value_from_partial_bytes(self, ctx, idx, data):
         assert type(ctx) == Lookup
-        idx, n = Quantity().value_from_bytes(ctx, idx, data)
+        idx, n = Quantity().value_from_partial_bytes(ctx, idx, data)
         k = self.options.key(n)
-        idx, w = self.options[k].value_from_bytes(ctx, idx, data)
+        idx, w = self.options[k].value_from_partial_bytes(ctx, idx, data)
         return idx, (k, w)
 
     def encode_impl(self):
@@ -414,8 +421,8 @@ class Struct(Type):
     def value_to_bytes(self, ctx, v):
         return Tuple([t for k, t in self.attribs.items()]).value_to_bytes(ctx, [v[k] for k in self.attribs.keys()])
  
-    def value_from_bytes(self, ctx, idx, data):
-        idx, v = Tuple([t for k, t in self.attribs.items()]).value_from_bytes(ctx, idx, data)
+    def value_from_partial_bytes(self, ctx, idx, data):
+        idx, v = Tuple([t for k, t in self.attribs.items()]).value_from_partial_bytes(ctx, idx, data)
         return idx, {k : v[i] for i, k in enumerate(self.attribs.keys())}
 
     def encode_impl(self):
@@ -456,7 +463,7 @@ class Deserializer():
     def deserialize(self):
         def f(ctx, d):
             assert type(ctx) == Lookup
-            n, m = self._t.value_from_bytes(ctx, d)
+            n, m = self._t.value_from_partial_bytes(ctx, d)
             assert n == len(d)
             return self._decode(m)
         return f
@@ -467,15 +474,15 @@ def MessageDeserializer(msg):
 
 META_CTX = Lookup({Key(b"key") : Key.get_type(),
                    Key(b"lookup") : Lookup.get_type(),
-                   Key(b"type") : Type.get_type()})
+                   Key(b"type") : Type.get_type(),
+                   Key(b"protocol") : Variant(Lookup({Key(b"server") : Tuple([]),
+                                                      Key(b"client") : Tuple([])}))})
 
 
 
 import socket
 import time
 import threading
-
-
 
 
 
@@ -494,7 +501,7 @@ def recv_dgram(sock):
             if b // 128 == 0: #end of quantity
                 done = True
             buf += bytes([b])
-    idx, n = Quantity().value_from_bytes(Lookup({}), 0, buf)
+    idx, n = Quantity().value_from_partial_bytes(Lookup({}), 0, buf)
     buf = buf[idx:]
     while len(buf) < n:
         try:
@@ -503,7 +510,9 @@ def recv_dgram(sock):
             time.sleep(0.1)
     return buf
 
-class Server():
+
+
+class Server():    
     def __init__(self, ctx, host, port):
         assert type(ctx) == Lookup
         self.host = host
@@ -540,16 +549,20 @@ class Server():
         client_meta_ctx = Lookup.deserialize(META_CTX, d)
         assert META_CTX == client_meta_ctx
 
-        #2) compare ctx
+        #2) compare connection type
+        send_dgram(conn, META_CTX[Key(b"conn_t")].value_to_bytes(Lookup({}), (Key(b"server"), [])))
+        other_conn_t = META_CTX[Key(b"conn_t")].value_from_bytes(Lookup({}), recv_dgram(conn))
+        assert other_conn_t == (Key(b"client"), [])
+
+        #3) compare ctx
         send_dgram(conn, self.ctx.serialize(META_CTX))
         client_ctx = Lookup.deserialize(META_CTX, recv_dgram(conn))
         assert self.ctx == client_ctx
 
-        #3) do stuff
+        #4) do stuff
         print("server connected")
 
-
-class Client():
+class Client():    
     def __init__(self, ctx, host, port):
         assert type(ctx) == Lookup
         self.ctx = ctx
@@ -572,12 +585,17 @@ class Client():
         server_meta_ctx = Lookup.deserialize(META_CTX, recv_dgram(self.sock))
         assert META_CTX == server_meta_ctx
 
-        #2) compare ctx
+        #2) compare connection type
+        send_dgram(self.sock, META_CTX[Key(b"conn_t")].value_to_bytes(Lookup({}), (Key(b"client"), [])))
+        other_conn_t = META_CTX[Key(b"conn_t")].value_from_bytes(Lookup({}), recv_dgram(self.sock))
+        assert other_conn_t == (Key(b"server"), [])
+        
+        #3) compare ctx
         send_dgram(self.sock, self.ctx.serialize(META_CTX))
         server_ctx = Lookup.deserialize(META_CTX, recv_dgram(self.sock))
         assert self.ctx == server_ctx
 
-        #3) do stuff
+        #4) do stuff
         print("client connected")
 
     def register_caller(self, name, input_serializers, output_deserializer):
@@ -667,7 +685,7 @@ class Connection():
                 return None
             
             #parse the quantity
-            idx, n = Quantity().value_from_bytes(self._ctx, 0, self._buf)
+            idx, n = Quantity().value_from_partial_bytes(self._ctx, 0, self._buf)
             #check if we have the whole dgram
             if idx + n <= len(self._buf):
                 dgram = self._buf[idx:idx+n]
@@ -693,14 +711,40 @@ class Connection():
 
 def test_socket():
     ctx = Lookup({})
+
+    class Int(Message):
+        def __init__(self, n):
+            assert type(n) == int
+            self.n = n
+        def __repr__(self):
+            return f"Int({self.n})"
+        @classmethod
+        def get_type(cls):
+            return Tuple([Quantity(), Quantity()])
+        def encode(self):
+            if self.n >= 0:
+                return [self.n, 0]
+            else:
+                return [0, -self.n]
+        @classmethod
+        def decode(cls, v):
+            assert len(v) == 2
+            return cls(Quantity.decode(v[0]) - Quantity.decode(v[1]))
     
     server = Server(ctx, "127.0.0.1", 5000)
+    def flub(n):
+        return n + 1
+    server.register_function(Key(b"flub"), flub, [MessageDeserializer(Int)], MessageSerializer(Int))
+    def floobe(n):
+        return n * 2
+    server.register_function(Key(b"floobe"), floobe, [MessageDeserializer(Int)], MessageSerializer(Int))
+    
     thread = threading.Thread(target = server.run)
     thread.start()
+
+    
     
     client = Client(ctx, "127.0.0.1", 5000)
-
-    print("do stuff")
 
     return 
     
@@ -804,7 +848,7 @@ def test():
             t.validate_value(ctx, v)
             d = t.value_to_bytes(ctx, v)
             print("d =", d)
-            n, w = t.value_from_bytes(ctx, 0, d)
+            n, w = t.value_from_partial_bytes(ctx, 0, d)
             print("w =", w)
             assert n == len(d)
             assert v == w
@@ -820,7 +864,7 @@ def test():
         t.validate_value(ctx, v)
         d = t.value_to_bytes(ctx, v)
         print("d =", d)
-        n, w = t.value_from_bytes(ctx, 0, d)
+        n, w = t.value_from_partial_bytes(ctx, 0, d)
         print("w =", w)
         assert n == len(d)
         assert v == w
@@ -844,14 +888,14 @@ def test():
         ctx = META_CTX
         
         #test_key_message_serialize_and_deserialize
-        #key using encode -> value_to_bytes -> value_from_bytes -> decode
+        #key using encode -> value_to_bytes -> value_from_partial_bytes -> decode
         m = Key(b"hello")
         print("m =", m)
         v = m.encode()
         print("v =", v)
         d = Named(Key(b"key")).value_to_bytes(ctx, v)
         print("d =", d)
-        idx, w = Named(Key(b"key")).value_from_bytes(ctx, 0, d)
+        idx, w = Named(Key(b"key")).value_from_partial_bytes(ctx, 0, d)
         print("w =", w)
         assert idx == len(d)
         assert v == w
@@ -880,7 +924,7 @@ def test():
             print("v =", v)
             d = Named(Key(b"lookup")).value_to_bytes(ctx, v)
             print("d =", d)
-            idx, w = Named(Key(b"lookup")).value_from_bytes(ctx, 0, d)
+            idx, w = Named(Key(b"lookup")).value_from_partial_bytes(ctx, 0, d)
             print("w =", w)
             assert idx == len(d)
             assert v == w
