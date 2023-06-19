@@ -506,59 +506,47 @@ def recv_dgram(sock):
 class Server():
     def __init__(self, ctx, host, port):
         assert type(ctx) == Lookup
+        self.host = host
+        self.port = port
         self.ctx = ctx
+        self.funcs = {}
+
+    def register_function(self, name, f, input_deserializers, output_serializer):
+        assert type(name) == Key
+        input_deserializers = list(input_deserializers)
+        for input_deserializer in input_deserializers:
+            assert type(input_deserializer) == Deserializer
+        assert type(output_serializer) == Serializer
+        self.funcs[name] = (f, input_deserializers, output_serializer)
         
-        self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.socket.bind((host, port))
-        self.socket.settimeout(0.1)
-        self.socket.listen()
-
-        self.thread = threading.Thread(target = self.run)
-        self.stop_thread = False
-        self.lock = threading.Lock()
-
-    def __enter__(self):
-        self.thread.start()
-
-    def __exit__(self, exc_type, exc_value, traceback):
-        with self.lock:
-            self.stop_thread = True
-        self.thread.join()
-
     def run(self):
-        def handle(conn):
-            #1) compare metactx
-            send_dgram(conn, META_CTX.serialize(META_CTX))
-            d = recv_dgram(conn)
-            client_meta_ctx = Lookup.deserialize(META_CTX, d)
-            assert META_CTX == client_meta_ctx
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.bind((self.host, self.port))
+        sock.settimeout(1)
+        sock.listen()
 
-            #2) compare ctx
-            send_dgram(conn, self.ctx.serialize(META_CTX))
-            client_ctx = Lookup.deserialize(META_CTX, recv_dgram(conn))
-            assert self.ctx == client_ctx
-
-            print("tada")
-
-        handle_threads = []
+        #0) connect to one client
         while True:
-            for idx, thread in reversed(tuple(enumerate(handle_threads))):
-                if not thread.is_alive():
-                    handle_threads.pop(idx)
-            
-            with self.lock:
-                if self.stop_thread:
-                    for thread in handle_threads:
-                        thread.join()
-                    return
             try:
-                conn, other_addr = self.socket.accept()
-            except socket.timeout:
+                conn, other_addr = sock.accept()
+            except socket.timeout as e:
                 pass
             else:
-                thread = threading.Thread(target = handle, args = (conn,))
-                thread.start()
-                handle_threads.append(thread)
+                break
+        
+        #1) compare metactx
+        send_dgram(conn, META_CTX.serialize(META_CTX))
+        d = recv_dgram(conn)
+        client_meta_ctx = Lookup.deserialize(META_CTX, d)
+        assert META_CTX == client_meta_ctx
+
+        #2) compare ctx
+        send_dgram(conn, self.ctx.serialize(META_CTX))
+        client_ctx = Lookup.deserialize(META_CTX, recv_dgram(conn))
+        assert self.ctx == client_ctx
+
+        #3) do stuff
+        print("server connected")
 
 
 class Client():
@@ -568,28 +556,44 @@ class Client():
         self.host = host
         self.port = port
 
-        sock = self.make_connected_socket()
-        #1) compare metactx
-        send_dgram(sock, META_CTX.serialize(META_CTX))
-        server_meta_ctx = Lookup.deserialize(META_CTX, recv_dgram(sock))
-        assert META_CTX == server_meta_ctx
-
-        #2) compare ctx
-        send_dgram(sock, self.ctx.serialize(META_CTX))
-        server_ctx = Lookup.deserialize(META_CTX, recv_dgram(sock))
-        assert self.ctx == server_ctx
-
-    def make_connected_socket(self):
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        #0) connect to one server
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         while True:
             try:
-                sock.connect((self.host, self.port))
+                self.sock.connect((self.host, self.port))
             except ConnectionRefusedError as e:
                 print(e)
                 print("Retrying...")
             else:
-                return sock        
+                break
+            
+        #1) compare metactx
+        send_dgram(self.sock, META_CTX.serialize(META_CTX))
+        server_meta_ctx = Lookup.deserialize(META_CTX, recv_dgram(self.sock))
+        assert META_CTX == server_meta_ctx
 
+        #2) compare ctx
+        send_dgram(self.sock, self.ctx.serialize(META_CTX))
+        server_ctx = Lookup.deserialize(META_CTX, recv_dgram(self.sock))
+        assert self.ctx == server_ctx
+
+        #3) do stuff
+        print("client connected")
+
+    def register_caller(self, name, input_serializers, output_deserializer):
+        assert type(name) == Key
+        input_serializers = list(input_serializers)
+        for input_serializer in input_serializers:
+            assert type(input_serializer) == Serializer
+        assert type(output_deserializer) == Deserializer
+        
+        def f(*args):
+            assert (n := len(args)) == len(input_serializers)
+            for s, a in zip(input_serializers, args):
+                self._send_dgram(s.serialize(self._ctx, a))
+            return output_deserializer.deserialize(self._ctx, self._recv_dgrams(1))
+        
+        return f
 
 
 class Connection():
@@ -689,13 +693,14 @@ class Connection():
 
 def test_socket():
     ctx = Lookup({})
-    with Server(ctx, "127.0.0.1", 5000) as server:
-        client = Client(ctx, "127.0.0.1", 5000)
-        time.sleep(1)
-        client = Client(ctx, "127.0.0.1", 5000)
-        time.sleep(10)
+    
+    server = Server(ctx, "127.0.0.1", 5000)
+    thread = threading.Thread(target = server.run)
+    thread.start()
+    
+    client = Client(ctx, "127.0.0.1", 5000)
 
-    print("boo")
+    print("do stuff")
 
     return 
     
@@ -929,6 +934,8 @@ def test():
 
 
 
+
+
 if __name__ == "__main__":
 ##    test()
 ##    d = META_SPEC.serialize(META_SPEC.ctx)
@@ -955,7 +962,32 @@ if __name__ == "__main__":
 
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
     
+
+
 
 
 
